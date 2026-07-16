@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
         "-l",
         "--list",
         action="store_true",
+        help="fetch mail list and exit (no interactive mode)",
+    )
+    parser.add_argument(
+        "--accounts",
+        action="store_true",
         help="list configured account names and exit",
     )
     return parser.parse_args()
@@ -694,7 +699,7 @@ def main() -> int:
         logging.error(str(exc))
         return 1
 
-    if args.list:
+    if args.accounts:
         print_account_list(accounts)
         return 0
 
@@ -728,6 +733,8 @@ def main() -> int:
         return 0
 
     print_list(all_items, show_account=show_account)
+    if args.list:
+        return 0
     interact(all_items, show_account=show_account, reload_fn=_fetch_all)
     return 0
 
