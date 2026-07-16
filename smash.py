@@ -5,15 +5,20 @@ import logging
 import os
 import poplib
 import re
+import subprocess
 import sys
 import imaplib
 import shutil
+import termios
+import tty
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from email import message_from_bytes
 from email.message import Message
 from email.policy import default
 from email.utils import parsedate_to_datetime
+from html.parser import HTMLParser
 from typing import Any
 
 @dataclass
@@ -77,7 +82,10 @@ def configure_logging(args: argparse.Namespace) -> None:
     )
 
 
-def load_accounts(path: str = "accounts.json") -> list[dict[str, Any]]:
+ACCOUNTS_PATH = os.path.expanduser("~/.smash/accounts.json")
+
+
+def load_accounts(path: str = ACCOUNTS_PATH) -> list[dict[str, Any]]:
     if not os.path.exists(path):
         raise FileNotFoundError(f"{path} not found.")
 
@@ -122,61 +130,25 @@ def _header_text(msg: Message, key: str, fallback: str = "") -> str:
     return str(value).replace("\r", " ").replace("\n", " ").strip()
 
 
-def _extract_body_text(msg: Message) -> str:
-    plain_parts: list[str] = []
-    html_parts: list[str] = []
+def _get_leaf_parts(msg: Message) -> list[tuple[str, str]]:
+    """添付ファイル以外のリーフパートを返す。戻り値は (content_type, decoded_text) のリスト。"""
+
+    def decode_part(part: Message) -> str:
+        raw = part.get_payload(decode=True) or b""
+        charset = part.get_content_charset() or "utf-8"
+        return raw.decode(charset, errors="replace")
 
     if msg.is_multipart():
+        results = []
         for part in msg.walk():
             if part.get_content_maintype() == "multipart":
                 continue
             if part.get_content_disposition() == "attachment":
                 continue
+            results.append((part.get_content_type(), decode_part(part)))
+        return results
 
-            ctype = part.get_content_type()
-            try:
-                payload = part.get_content()
-            except Exception:
-                raw = part.get_payload(decode=True) or b""
-                charset = part.get_content_charset() or "utf-8"
-                payload = raw.decode(charset, errors="replace")
-
-            if isinstance(payload, bytes):
-                charset = part.get_content_charset() or "utf-8"
-                payload = payload.decode(charset, errors="replace")
-
-            if ctype == "text/plain":
-                plain_parts.append(payload)
-            elif ctype == "text/html":
-                html_parts.append(payload)
-    else:
-        try:
-            payload = msg.get_content()
-        except Exception:
-            raw = msg.get_payload(decode=True) or b""
-            charset = msg.get_content_charset() or "utf-8"
-            payload = raw.decode(charset, errors="replace")
-
-        if isinstance(payload, bytes):
-            charset = msg.get_content_charset() or "utf-8"
-            payload = payload.decode(charset, errors="replace")
-
-        ctype = msg.get_content_type()
-        if ctype == "text/plain":
-            plain_parts.append(payload)
-        elif ctype == "text/html":
-            html_parts.append(payload)
-
-    if plain_parts:
-        return "\n\n".join(plain_parts).strip()
-
-    if html_parts:
-        html = "\n\n".join(html_parts)
-        # Keep first version simple: strip tags for plain-text fallback.
-        text = re.sub(r"<[^>]+>", "", html)
-        return text.strip()
-
-    return "(本文をテキストとして取得できませんでした)"
+    return [(msg.get_content_type(), decode_part(msg))]
 
 
 def _linkify_urls(text: str) -> str:
@@ -197,6 +169,70 @@ def _linkify_urls(text: str) -> str:
         return linked + trailing
 
     return pattern.sub(replace, text)
+
+
+class _HtmlToText(HTMLParser):
+    _BLOCK_TAGS = frozenset({"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "pre"})
+    _SKIP_TAGS = frozenset({"script", "style", "head"})
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._parts: list[str] = []
+        self._skip_depth = 0
+        self._link_stack: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:
+        if tag in self._SKIP_TAGS:
+            self._skip_depth += 1
+        if tag == "a" and self._skip_depth == 0:
+            self._link_stack.append(dict(attrs).get("href", ""))
+        if self._skip_depth == 0 and tag in self._BLOCK_TAGS:
+            self._parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in self._SKIP_TAGS:
+            self._skip_depth = max(0, self._skip_depth - 1)
+        if tag == "a" and self._link_stack:
+            href = self._link_stack.pop()
+            if href and self._skip_depth == 0:
+                self._parts.append(f"\n{href}")
+        if self._skip_depth == 0 and tag in self._BLOCK_TAGS and tag != "br":
+            self._parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if self._skip_depth == 0:
+            self._parts.append(data)
+
+    def get_text(self) -> str:
+        lines = [line.strip() for line in "".join(self._parts).splitlines()]
+        result: list[str] = []
+        prev_blank = False
+        for line in lines:
+            if not line:
+                if not prev_blank:
+                    result.append("")
+                prev_blank = True
+            else:
+                result.append(line)
+                prev_blank = False
+        return "\n".join(result).strip()
+
+
+def _html_to_text(html: str) -> str:
+    parser = _HtmlToText()
+    try:
+        parser.feed(html)
+    except Exception:
+        return html
+    return parser.get_text()
+
+
+def _render_body(ctype: str, text: str) -> str:
+    if ctype == "text/plain":
+        return _linkify_urls(text)
+    if ctype == "text/html":
+        return _html_to_text(text)
+    return text
 
 
 def _fetch_from_imap(acc: dict[str, Any]) -> list[MailItem]:
@@ -343,6 +379,17 @@ def _fit_cell(text: str, width: int) -> str:
     return trimmed + (" " * pad)
 
 
+def _parse_date_for_sort(date_text: str) -> datetime:
+    """Dateヘッダをソート用のdatetimeに変換する。パース失敗時は最古扱いにして末尾に回す。"""
+    try:
+        dt = parsedate_to_datetime(date_text)
+    except Exception:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 def _format_date_text(date_text: str) -> str:
     try:
         dt = parsedate_to_datetime(date_text)
@@ -431,72 +478,210 @@ def print_list(items: list[MailItem], show_account: bool = True) -> None:
             print(f"{item.seq:>4} {from_col} {date_col} {subject_col}")
 
 
+def _page_or_print(text: str) -> None:
+    """端末の高さを超える場合は less / more でページングする。"""
+    term_height = shutil.get_terminal_size(fallback=(120, 30)).lines
+    if text.count("\n") < term_height - 2:
+        print(text)
+        return
+    for cmd in (["less", "-R", "-F", "-X"], ["more"]):
+        try:
+            subprocess.run(cmd, input=text, text=True, check=False)
+            return
+        except (FileNotFoundError, OSError):
+            continue
+    print(text)
+
+
 def print_detail(item: MailItem) -> None:
     msg = message_from_bytes(item.raw_message, policy=default)
-    body = _linkify_urls(_extract_body_text(msg))
 
-    print("\n" + "=" * 80)
-    print(f"No      : {item.seq}")
-    print(f"Account : {item.account_name} ({item.source_user})")
-    print(f"From    : {item.from_addr}")
-    print(f"Date    : {_format_date_text(item.date)}")
-    print(f"Subject : {item.subject}")
-    print("-" * 80)
-    print(body)
-    print("=" * 80 + "\n")
+    header = (
+        "\n" + "=" * 80 + "\n"
+        + f"No      : {item.seq}\n"
+        + f"Account : {item.account_name} ({item.source_user})\n"
+        + f"From    : {item.from_addr}\n"
+        + f"Date    : {_format_date_text(item.date)}\n"
+        + f"Subject : {item.subject}\n"
+        + "-" * 80
+    )
+
+    parts = _get_leaf_parts(msg)
+    if not parts:
+        print(header)
+        print("(本文をテキストとして取得できませんでした)")
+        print("=" * 80 + "\n")
+        return
+
+    if len(parts) == 1:
+        ctype, text = parts[0]
+        _page_or_print(header + "\n" + _render_body(ctype, text) + "\n" + "=" * 80 + "\n")
+    else:
+        print(header)
+        print(f"[マルチパート: {len(parts)} パート]")
+        for i, (ctype, _) in enumerate(parts, 1):
+            print(f"  {i}. {ctype}")
+        print()
+
+        selected = None
+        while selected is None:
+            value = input(f"表示するパートを選んでください (1-{len(parts)}, Enter でデフォルト): ").strip()
+            if value == "":
+                # デフォルト: text/plain があれば優先、なければ先頭
+                selected = next(
+                    (i for i, (ct, _) in enumerate(parts) if ct == "text/plain"),
+                    0,
+                )
+            elif value.isdigit() and 1 <= int(value) <= len(parts):
+                selected = int(value) - 1
+            else:
+                print(f"1〜{len(parts)} の数字を入力してください。")
+
+        ctype, text = parts[selected]
+        body_header = f"--- パート {selected + 1}: {ctype} ---\n"
+        _page_or_print(body_header + _render_body(ctype, text) + "\n" + "=" * 80 + "\n")
 
 
-def interact(items: list[MailItem], show_account: bool = True) -> None:
+_PROMPT = "[n=次 p=前 l=一覧 番号=指定 q=終了 ^L=リセット ^R=再読込] "
+
+
+def _read_command(prompt: str) -> str:
+    """プロンプトを表示してコマンドを読む。英字は1文字即時確定、数字はEnterまで蓄積。"""
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+
+    fd = sys.stdin.fileno()
+    old = termios.tcgetattr(fd)
+    chars: list[str] = []
+    try:
+        tty.setraw(fd)
+        while True:
+            ch = sys.stdin.read(1)
+            if ch == "\x03":  # Ctrl+C
+                raise KeyboardInterrupt
+            if ch == "\x0c":  # Ctrl+L
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return "\x0c"
+            if ch == "\x12":  # Ctrl+R
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return "\x12"
+            if ch in ("\r", "\n"):
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                break
+            if ch in ("\x7f", "\x08"):  # Backspace
+                if chars:
+                    chars.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+                continue
+            if not ch.isprintable():
+                continue
+            # 英字など非数字の1文字は即時確定
+            if not chars and not ch.isdigit():
+                sys.stdout.write(ch + "\r\n")
+                sys.stdout.flush()
+                return ch
+            chars.append(ch)
+            sys.stdout.write(ch)
+            sys.stdout.flush()
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+    return "".join(chars)
+
+
+def interact(items: list[MailItem], show_account: bool = True, reload_fn=None) -> None:
     if not items:
         return
 
-    index_map = {item.seq: item for item in items}
-    ordered_seqs = sorted(index_map.keys())
+    def _make_state(mail_items: list[MailItem]):
+        imap = {m.seq: m for m in mail_items}
+        return imap, sorted(imap.keys())
+
+    index_map, ordered_seqs = _make_state(items)
     last_seq: int | None = None
 
     while True:
-        value = input("番号を入力してください (qで終了): ").strip()
-        if value.lower() in {"q", "quit", "exit"}:
+        try:
+            cmd = _read_command(_PROMPT)
+        except KeyboardInterrupt:
             break
 
-        if value.lower() == "l":
+        cmd = cmd.strip()
+
+        if cmd.lower() in ("q", "x"):
+            break
+
+        if cmd == "\x0c":  # Ctrl+L: 端末クリア＋一覧再表示
+            sys.stdout.write("\033[2J\033[H")
+            sys.stdout.flush()
             print_list(items, show_account=show_account)
             continue
 
-        if value == "":
+        if cmd == "\x12":  # Ctrl+R: 再読み込み
+            if reload_fn is None:
+                print("再読み込みは利用できません。")
+                continue
+            print("再読み込み中...")
+            new_items = reload_fn()
+            if new_items is not None:
+                items = new_items
+                index_map, ordered_seqs = _make_state(items)
+                last_seq = None
+            print_list(items, show_account=show_account)
+            continue
+
+        if cmd.lower() == "l":
+            print_list(items, show_account=show_account)
+            continue
+
+        if cmd.lower() in ("n", ""):
             if not ordered_seqs:
                 print("表示できるメールがありません。")
                 continue
-
             if last_seq is None:
                 next_seq = ordered_seqs[0]
             else:
-                next_seq = None
-                for seq in ordered_seqs:
-                    if seq > last_seq:
-                        next_seq = seq
-                        break
+                next_seq = next((s for s in ordered_seqs if s > last_seq), None)
                 if next_seq is None:
                     print("最後のメールです。")
                     continue
-
             item = index_map[next_seq]
             print_detail(item)
             last_seq = next_seq
             continue
 
-        if not value.isdigit():
-            print("数字、l（一覧表示）、またはEnter（次のメール）を入力してください。")
+        if cmd.lower() == "p":
+            if last_seq is None:
+                print("前のメールはありません。")
+                continue
+            prev_seq = None
+            for s in ordered_seqs:
+                if s >= last_seq:
+                    break
+                prev_seq = s
+            if prev_seq is None:
+                print("最初のメールです。")
+                continue
+            item = index_map[prev_seq]
+            print_detail(item)
+            last_seq = prev_seq
             continue
 
-        seq = int(value)
-        item = index_map.get(seq)
-        if not item:
-            print("その番号は存在しません。")
+        if cmd.isdigit():
+            seq = int(cmd)
+            item = index_map.get(seq)
+            if not item:
+                print("その番号は存在しません。")
+                continue
+            print_detail(item)
+            last_seq = seq
             continue
 
-        print_detail(item)
-        last_seq = seq
+        print("コマンドが認識できません。n=次 p=前 l=一覧 番号=指定 q=終了")
 
 
 def main() -> int:
@@ -518,29 +703,32 @@ def main() -> int:
         logging.error("対象アカウントが見つかりませんでした。")
         return 1
 
-    all_items: list[MailItem] = []
-    offset = 0
+    show_account = args.target is None
 
-    for acc in targets:
-        name = acc.get("name", acc.get("user", "unknown"))
-        try:
-            account_items = fetch_mail_items(acc)
-        except Exception as exc:
-            logging.error(f"[{name}] 取得失敗: {exc}")
-            continue
+    def _fetch_all() -> list[MailItem]:
+        result: list[MailItem] = []
+        for acc in targets:
+            name = acc.get("name", acc.get("user", "unknown"))
+            try:
+                account_items = fetch_mail_items(acc)
+            except Exception as exc:
+                logging.error(f"[{name}] 取得失敗: {exc}")
+                continue
+            result.extend(account_items)
 
-        # Renumber globally to keep a single interactive index across accounts.
-        for item in account_items:
-            item.seq += offset
-        offset += len(account_items)
-        all_items.extend(account_items)
+        result.sort(key=lambda item: _parse_date_for_sort(item.date), reverse=True)
+        for seq, item in enumerate(result, 1):
+            item.seq = seq
+        return result
+
+    all_items = _fetch_all()
 
     if not all_items:
         print("表示できるメールがありません。")
         return 0
 
-    print_list(all_items, show_account=args.target is None)
-    interact(all_items, show_account=args.target is None)
+    print_list(all_items, show_account=show_account)
+    interact(all_items, show_account=show_account, reload_fn=_fetch_all)
     return 0
 
 
