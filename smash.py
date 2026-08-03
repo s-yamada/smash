@@ -29,6 +29,7 @@ class MailItem:
     from_addr: str
     date: str
     subject: str
+    has_attachment: bool
     raw_message: bytes
 
 
@@ -133,6 +134,21 @@ def _header_text(msg: Message, key: str, fallback: str = "") -> str:
     if value is None:
         return fallback
     return str(value).replace("\r", " ").replace("\n", " ").strip()
+
+
+def _has_non_text_attachment(msg: Message) -> bool:
+    """text/* 以外の添付ファイルを含むかどうかを判定する。"""
+    if not msg.is_multipart():
+        return False
+    for part in msg.walk():
+        if part.get_content_maintype() == "multipart":
+            continue
+        if part.get_content_disposition() != "attachment":
+            continue
+        if part.get_content_maintype() == "text":
+            continue
+        return True
+    return False
 
 
 def _get_leaf_parts(msg: Message) -> list[tuple[str, str]]:
@@ -277,6 +293,7 @@ def _fetch_from_imap(acc: dict[str, Any]) -> list[MailItem]:
                     from_addr=_header_text(msg, "From", "(no from)"),
                     date=_header_text(msg, "Date", "(no date)"),
                     subject=_header_text(msg, "Subject", "(no subject)"),
+                    has_attachment=_has_non_text_attachment(msg),
                     raw_message=raw,
                 )
             )
@@ -320,6 +337,7 @@ def _fetch_from_pop3(acc: dict[str, Any]) -> list[MailItem]:
                     from_addr=_header_text(msg, "From", "(no from)"),
                     date=_header_text(msg, "Date", "(no date)"),
                     subject=_header_text(msg, "Subject", "(no subject)"),
+                    has_attachment=_has_non_text_attachment(msg),
                     raw_message=raw,
                 )
             )
@@ -341,16 +359,25 @@ def fetch_mail_items(acc: dict[str, Any]) -> list[MailItem]:
     raise ValueError(f"Unsupported account type: {acc_type}")
 
 
+_AMBIGUOUS_WIDTH = 1  # Unicode "Ambiguous"（"“”‘’—–…①②"など）の扱い。端末・フォント依存のため要調整の余地を残す
+
+
 def _char_display_width(ch: str) -> int:
     if unicodedata.combining(ch):
         return 0
-    if unicodedata.east_asian_width(ch) in {"F", "W", "A"}:
+    eaw = unicodedata.east_asian_width(ch)
+    if eaw in {"F", "W"}:
         return 2
+    if eaw == "A":
+        return _AMBIGUOUS_WIDTH
     return 1
 
 
 def _display_width(text: str) -> int:
     return sum(_char_display_width(ch) for ch in text)
+
+
+_LIST_ELLIPSIS = ""  # 省略記号。"..." にすると末尾に付与されるが、その分だけ表示できる文字数が減る
 
 
 def _truncate_to_width(text: str, width: int) -> str:
@@ -359,7 +386,7 @@ def _truncate_to_width(text: str, width: int) -> str:
     if _display_width(text) <= width:
         return text
 
-    ellipsis = "..."
+    ellipsis = _LIST_ELLIPSIS
     ellipsis_width = _display_width(ellipsis)
     if width <= ellipsis_width:
         return "." * width
@@ -409,8 +436,8 @@ def _format_date_text(date_text: str) -> str:
 def _list_column_widths(show_account: bool) -> dict[str, int]:
     cols = shutil.get_terminal_size(fallback=(120, 30)).columns
 
-    # no(4) + separators
-    fixed_overhead = 8 if show_account else 7
+    # no(4) + mark(1) + separators
+    fixed_overhead = 10 if show_account else 9
     from_w = 24
     date_w = 19
     min_subject = 24
@@ -457,6 +484,7 @@ def print_list(items: list[MailItem], show_account: bool = True) -> None:
     if show_account:
         header = (
             f"{'No.':>4} "
+            f"{' ':1} "
             f"{_fit_cell('From', widths['from'])} "
             f"{_fit_cell('Date', widths['date'])} "
             f"{_fit_cell('Subject', widths['subject'])} "
@@ -465,6 +493,7 @@ def print_list(items: list[MailItem], show_account: bool = True) -> None:
     else:
         header = (
             f"{'No.':>4} "
+            f"{' ':1} "
             f"{_fit_cell('From', widths['from'])} "
             f"{_fit_cell('Date', widths['date'])} "
             f"{_fit_cell('Subject', widths['subject'])}"
@@ -473,14 +502,15 @@ def print_list(items: list[MailItem], show_account: bool = True) -> None:
     print("\n" + header)
     print("-" * _display_width(header))
     for item in items:
+        mark_col = "@" if item.has_attachment else " "
         from_col = _fit_cell(item.from_addr, widths["from"])
         date_col = _fit_cell(_format_date_text(item.date), widths["date"])
         subject_col = _fit_cell(item.subject, widths["subject"])
         if show_account:
             account_col = _fit_cell(item.account_name, widths["account"])
-            print(f"{item.seq:>4} {from_col} {date_col} {subject_col} {account_col}")
+            print(f"{item.seq:>4} {mark_col} {from_col} {date_col} {subject_col} {account_col}")
         else:
-            print(f"{item.seq:>4} {from_col} {date_col} {subject_col}")
+            print(f"{item.seq:>4} {mark_col} {from_col} {date_col} {subject_col}")
 
 
 def _page_or_print(text: str) -> None:
