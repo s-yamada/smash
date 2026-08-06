@@ -559,18 +559,22 @@ def print_detail(item: MailItem) -> None:
         print()
 
         selected = None
-        while selected is None:
-            value = input(f"表示するパートを選んでください (1-{len(parts)}, Enter でデフォルト): ").strip()
-            if value == "":
-                # デフォルト: text/plain があれば優先、なければ先頭
-                selected = next(
-                    (i for i, (ct, _) in enumerate(parts) if ct == "text/plain"),
-                    0,
-                )
-            elif value.isdigit() and 1 <= int(value) <= len(parts):
-                selected = int(value) - 1
-            else:
-                print(f"1〜{len(parts)} の数字を入力してください。")
+        try:
+            while selected is None:
+                value = input(f"表示するパートを選んでください (1-{len(parts)}, Enter でデフォルト): ").strip()
+                if value == "":
+                    # デフォルト: text/plain があれば優先、なければ先頭
+                    selected = next(
+                        (i for i, (ct, _) in enumerate(parts) if ct == "text/plain"),
+                        0,
+                    )
+                elif value.isdigit() and 1 <= int(value) <= len(parts):
+                    selected = int(value) - 1
+                else:
+                    print(f"1〜{len(parts)} の数字を入力してください。")
+        except (KeyboardInterrupt, EOFError):
+            print("\n選択を中止しました。")
+            return
 
         ctype, text = parts[selected]
         body_header = f"--- パート {selected + 1}: {ctype} ---\n"
