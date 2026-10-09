@@ -455,16 +455,29 @@ def _list_column_widths(show_account: bool) -> dict[str, int]:
         reducible = max(0, date_w - 16)
         cut = min(shortage, reducible)
         date_w -= cut
+        shortage -= cut
+        # 16まで削っても足りない場合（極端に狭い端末）は、1まで追加で削って残りを吸収する。
+        # ここで吸収しきらないと、Subject/Accountの最低幅同士の合計が使える幅を超え、行がはみ出す。
+        if shortage > 0:
+            cut = min(shortage, from_w - 1)
+            from_w -= cut
+            shortage -= cut
+        if shortage > 0:
+            cut = min(shortage, date_w - 1)
+            date_w -= cut
+            shortage -= cut
 
     dynamic = max(0, cols - (fixed_overhead + from_w + date_w))
     if show_account:
         subject_w = max(min_subject, int(dynamic * 0.7))
-        account_w = max(min_account, dynamic - subject_w)
-        if subject_w + account_w > dynamic:
-            subject_w = max(min_subject, dynamic - min_account)
-            account_w = max(min_account, dynamic - subject_w)
+        account_w = dynamic - subject_w
+        if account_w < min_account:
+            account_w = min(min_account, dynamic)
+            subject_w = dynamic - account_w
+        subject_w = max(1, subject_w)
+        account_w = max(0, dynamic - subject_w)
     else:
-        subject_w = max(min_subject, dynamic)
+        subject_w = max(1, dynamic)
         account_w = 0
 
     return {
